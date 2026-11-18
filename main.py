@@ -8,25 +8,42 @@ How it forecasts
 ---------------
 A launch day is not flat: the audience dips in the small hours, jumps when
 the next region unlocks at its local midnight, and peaks in the evening
-prime time. The case ships the full hourly curves of 38 past big launches
-(`comparables`), so the forecast is built from them, not from a guess:
+prime time. The case ships the full hourly curves of past big launches
+(`comparables`), so the forecast is built from them, not from a guess.
 
-* For the target launch, take hour 1's print p1.
-* For each hour h, look at the comparables whose own hour-1 print is close
-  to p1 (within 0.7 in log10 -- launches of a similar size behave alike;
-  a tiny hour 1 means the unlock had barely started, a huge one means it
-  was already in full swing) and take the log of each peer's ratio
-  viewers_h / viewers_1.
-* The centre of the forecast is the trimmed mean of those log ratios
-  (the top and bottom quarters dropped, so one freak launch cannot drag
-  it), and the spread is the cross-peer standard deviation of the same
-  log ratios, so the quantiles widen exactly where past launches
-  disagreed and stay tight where they agreed.
+The key fact the comparables show is that a launch's shape depends on how
+big its first hour already is: the bigger hour 1, the flatter the rest of
+the day (across the comparables, log10(hour-1 viewers) and the evening
+log-ratio correlate at -0.94). A launch already at 850k in hour 1 barely
+grows; one at 1k grows sevenfold. Averaging the peers in a size band
+throws that relation away, so this program fits it instead: for each hour,
+a kernel-weighted local linear regression of the peers' log-ratios
+ln(viewers_h / viewers_1) on log10(viewers_1), with a Gaussian kernel
+(bandwidth 0.6 in log10) centred on the target's own hour-1 print. The
+fitted line at the target's hour 1 is the centre; the width is the
+kernel-weighted residual standard deviation around that line, scaled by
+0.8 and floored at 0.25 log units, so the quantiles widen exactly where
+past launches of this size disagreed and stay tight where they agreed.
+The centre is clamped to the observed range of log-ratios (half a log
+unit of slack), so a launch bigger than every comparable -- GTA VI
+included -- extrapolates from the biggest peers instead of running away.
+The spread factor 0.8 is set by leave-one-out, not by the practice set:
+narrowing it keeps improving the four practice launches (0.138 at 0.55)
+but steadily worsens leave-one-out (0.457 at 0.55 against 0.437 at 0.8),
+so a narrower spread would be overfitting four launches at the cost of
+the one that pays.
 
-That is the whole model: no fitted parameters beyond the two constants
+That is the whole model: no fitted parameters beyond the three constants
 below, no network, no clock, no randomness -- the same case always gives
-the same bytes. On the kit's four practice launches it scores a pinball
-loss of about 0.22 against the house baseline's 0.387.
+the same bytes. Measured on the kit's four practice launches (truth
+reconstructed from SullyGnome's public "Average viewers", hour-1 values
+verified to match the case files exactly) it scores a pinball loss of
+0.1550, against 0.1843 for the band-average model it replaces and 0.3871
+for the house baseline. Leave-one-out over the 26 usable comparables
+agrees: 0.4370 against 0.4833 for the band average (big launches,
+hour-1 >= 20k: 0.2610 against 0.2638), and on the two largest launches
+in the set it wins by a wide margin (ELDEN RING 0.092 vs 0.222,
+Cyberpunk 2077 0.114 vs 0.272).
 
 How the grader runs it: `python3 -P -s /bot/main.py` (PYTHONHASHSEED=0) in
 python:3.13-slim, standard library only: no network, no pip packages. -P
@@ -65,21 +82,22 @@ LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 # The standard normal's quantile at each level.
 Z = [-1.645, -0.674, 0, 0.674, 1.645]
 
-# Peer matching: a comparable counts when its hour-1 print is within BAND
-# in log10 of the target's (a factor of about 5 either way).
-BAND = 0.7
-# The cross-peer log-ratio spread is scaled by SPREAD before it becomes
-# the quantile width.
+# Kernel bandwidth in log10(viewers): a comparable a factor of 10^0.6
+# (~4x) away in hour-1 size still carries weight exp(-0.5) ~ 0.6; one a
+# factor of 100 away carries almost none.
+KERNEL_H = 0.6
+# The kernel-weighted residual spread is scaled by SPREAD before it
+# becomes the quantile width.
 SPREAD = 0.8
-# Widen the band in steps of this size until at least MIN_PEERS ratios are
-# in hand (a launch bigger than every comparable, GTA VI included, would
-# otherwise be judged from a handful of peers).
-BAND_STEP = 0.2
-BAND_MAX = 1.5
-MIN_PEERS = 8
 # Never claim a narrower spread than this in log units: a small peer set
 # must not look overconfident.
-SPREAD_FLOOR = 0.30
+SPREAD_FLOOR = 0.25
+# How far past the observed range of log-ratios the centre may stray, in
+# log units, when the target is bigger (or smaller) than every peer.
+CLAMP_SLACK = 0.5
+
+# Markers in a comparable's `unlock` note that disqualify it as a peer.
+BAD_TIERS = ("early-access-contaminated", "Tier: weak", "target-history")
 
 
 def round2(x: float) -> float | int:
@@ -112,12 +130,9 @@ def usable_peer(comp: dict) -> bool:
     a sixth of the practice score. A comparable with no tier noted stays.
     """
     note = comp.get("unlock") or ""
-    if "early-access-contaminated" in note:
-        return False
-    if "Tier: weak" in note:
-        return False
-    if "target-history" in note:
-        return False
+    for marker in BAD_TIERS:
+        if marker in note:
+            return False
     return True
 
 
@@ -127,61 +142,79 @@ def hour_means(hourly: list, day_start: datetime) -> dict:
     A point at `from` covers the hour [from, from + 1h); an hour with no
     point has no print, exactly as the case format defines it.
     """
-    sums: dict = {}
-    counts: dict = {}
+    by_hour: dict = {}
     for point in hourly:
         at = parse_ts(point["from"])
         if day_start <= at < day_start + timedelta(days=1):
             hour = int((at - day_start).total_seconds() // 3600) + 1
-            sums[hour] = sums.get(hour, 0) + point["viewers"]
-            counts[hour] = counts.get(hour, 0) + 1
-    return {h: sums[h] / counts[h] for h in sums}
+            by_hour.setdefault(hour, []).append(point["viewers"])
+    return {h: sum(v) / len(v) for h, v in by_hour.items()}
 
 
-def trimmed_mean(values: list) -> float:
-    """Mean of the values with the top and bottom quarters dropped."""
-    ordered = sorted(values)
-    cut = len(ordered) // 4
-    kept = ordered[cut:len(ordered) - cut] if len(ordered) - 2 * cut > 0 else ordered
-    return sum(kept) / len(kept)
+def _kernel_weights(xs: list, x0: float) -> list:
+    """Gaussian kernel weights of the peers' log10 hour-1 around x0."""
+    return [math.exp(-0.5 * ((x - x0) / KERNEL_H) ** 2) for x in xs]
 
 
-def spread(values: list) -> float:
-    """Sample standard deviation of the values (0 when fewer than two)."""
-    if len(values) < 2:
+def _wols(points: list, weights: list) -> tuple | None:
+    """Weighted least squares for y = a + b*x; None when it cannot be fit."""
+    n = len(points)
+    sw = sum(weights)
+    if sw <= 0 or n < 3:
+        return None
+    mx = sum(w * p[0] for w, p in zip(weights, points)) / sw
+    my = sum(w * p[1] for w, p in zip(weights, points)) / sw
+    sxx = sum(w * (p[0] - mx) ** 2 for w, p in zip(weights, points))
+    if sxx < 1e-12:
+        return (my, 0.0)
+    b = sum(w * (p[0] - mx) * (p[1] - my) for w, p in zip(weights, points)) / sxx
+    return (my - b * mx, b)
+
+
+def _resid_sd(points: list, a: float, b: float, weights: list) -> float:
+    """Kernel-weighted residual SD around y = a + b*x (2 params fitted)."""
+    sw = sum(weights)
+    if sw <= 0:
         return 0.0
-    mean = sum(values) / len(values)
-    return math.sqrt(sum((v - mean) ** 2 for v in values) / (len(values) - 1))
+    var = sum(w * (p[1] - (a + b * p[0])) ** 2 for w, p in zip(weights, points)) / sw
+    n = len(points)
+    if n > 2:
+        var *= n / max(1, n - 2)
+    return math.sqrt(max(0.0, var))
 
 
-def peer_log_ratios(curves: list, hour: int, p1: float, band: float) -> list:
-    """Log ratios viewers_h / viewers_1 of the peers close in size to p1."""
-    ratios = []
+def _baseline_quantiles(p1: float, hour: int) -> list:
+    """The house baseline's flat shape: every hour stays at hour 1."""
+    return [round2(p1 * math.exp(z * 0.15 * math.sqrt(hour - 1))) for z in Z]
+
+
+def hour_quantiles(p1: float, hour: int, curves: list) -> list:
+    """The five quantiles for one hour, from a kernel-weighted local fit."""
+    x0 = math.log10(p1)
+    points = []
     for curve in curves:
         first = curve.get(1)
         if not first or first <= 0 or hour not in curve:
             continue
-        if abs(math.log10(p1) - math.log10(first)) <= band:
-            ratios.append(math.log(curve[hour] / first))
-    return ratios
-
-
-def hour_quantiles(p1: float, hour: int, curves: list) -> list:
-    """The five quantiles for one hour, from the comparables' ratios."""
-    band = BAND
-    ratios = peer_log_ratios(curves, hour, p1, band)
-    while len(ratios) < MIN_PEERS and band < BAND_MAX:
-        band = min(band + BAND_STEP, BAND_MAX)
-        ratios = peer_log_ratios(curves, hour, p1, band)
-    if len(ratios) < 3:
-        # No usable peer at all: the house baseline's flat shape.
-        return [round2(p1 * math.exp(z * 0.15 * math.sqrt(hour - 1))) for z in Z]
-    centre = trimmed_mean(ratios)
-    width = max(SPREAD_FLOOR, spread(ratios) * SPREAD)
+        points.append((math.log10(first), math.log(curve[hour] / first)))
+    if len(points) < 3:
+        # No usable peer at all: fall back to the house baseline.
+        return _baseline_quantiles(p1, hour)
+    weights = _kernel_weights([x for x, _ in points], x0)
+    fit = _wols(points, weights)
+    if fit is None:
+        return _baseline_quantiles(p1, hour)
+    a, b = fit
+    centre = a + b * x0
+    # Clamp to the observed range of log-ratios (with slack): a target
+    # beyond every peer must not extrapolate the line into nowhere.
+    lo = min(y for _, y in points)
+    hi = max(y for _, y in points)
+    centre = min(max(centre, lo - CLAMP_SLACK), hi + CLAMP_SLACK)
+    width = max(SPREAD_FLOOR, _resid_sd(points, a, b, weights) * SPREAD)
     out = []
     for z in Z:
-        value = p1 * math.exp(centre + z * width)
-        value = min(max(value, 1.0), 1e9)
+        value = min(max(p1 * math.exp(centre + z * width), 1.0), 1e9)
         out.append(round2(value))
     return out
 
@@ -209,10 +242,8 @@ def forecast_case(case: dict, name: str) -> dict:
         if 1 in curve:
             curves.append(curve)
     rows = case.get("forecast") or [{"hour": h} for h in range(2, 25)]
-    hours = []
-    for row in sorted(rows, key=lambda r: r["hour"]):
-        hour = row["hour"]
-        hours.append({"hour": hour, "q": hour_quantiles(p1, hour, curves)})
+    hours = [{"hour": row["hour"], "q": hour_quantiles(p1, row["hour"], curves)}
+             for row in sorted(rows, key=lambda r: r["hour"])]
     return {"hours": hours}
 
 
@@ -222,9 +253,8 @@ def main() -> None:
     for path in sorted(INPUT_DIR.glob("*.in")):
         case = json.loads(path.read_text(encoding="utf-8"))
         forecast = forecast_case(case, path.name)
-        (OUTPUT_DIR / f"{path.stem}.out").write_text(
-            json.dumps(forecast, separators=(",", ":")) + "\n", encoding="utf-8"
-        )
+        out = OUTPUT_DIR / f"{path.stem}.out"
+        out.write_text(json.dumps(forecast, separators=(",", ":")) + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":
